@@ -1,132 +1,98 @@
-// server.js - Main server file for Socket.io chat application
+// backend/server.js
+import express from "express";
+import http from "http";
+import { Server } from "socket.io";
+import cors from "cors";
+import dotenv from "dotenv";
+import connectDB from "./config/db.js";
+import authRoutes from "./routes/auth.js";
+import multer from "multer";
+import path from "path";
+import { fileURLToPath } from "url";
 
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-const cors = require('cors');
-const dotenv = require('dotenv');
-const path = require('path');
-
-// Load environment variables
 dotenv.config();
+connectDB();
 
-// Initialize Express app
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
-    methods: ['GET', 'POST'],
-    credentials: true,
-  },
-});
-
-// Middleware
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
-// Store connected users and messages
-const users = {};
-const messages = [];
-const typingUsers = {};
+const upload = multer({ dest: "uploads/" });
+app.post("/upload", upload.single("file"), (req, res) => {
+  res.json({ file: `/uploads/${req.file.filename}` });
+});
 
-// Socket.io connection handler
-io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
+app.use("/api/auth", authRoutes);
+app.get("/", (req, res) => res.send("Chat API Running"));
 
-  // Handle user joining
-  socket.on('user_join', (username) => {
-    users[socket.id] = { username, id: socket.id };
-    io.emit('user_list', Object.values(users));
-    io.emit('user_joined', { username, id: socket.id });
-    console.log(`${username} joined the chat`);
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: "http://localhost:5173", methods: ["GET", "POST"] },
+});
+
+const onlineUsers = new Map();
+const typingUsers = new Set();
+
+io.use((socket, next) => {
+  const token = socket.handshake.auth.token;
+  if (!token) return next(new Error("Unauthorized"));
+  try {
+    const payload = JSON.parse(atob(token.split(".")[1]));
+    socket.user = { id: payload.id, username: payload.username };
+    next();
+  } catch (e) {
+    next(new Error("Invalid token"));
+  }
+});
+
+io.on("connection", (socket) => {
+  const user = socket.user;
+  onlineUsers.set(user.id, { socketId: socket.id, username: user.username });
+  io.emit("user-online", { userId: user.id, username: user.username });
+
+  socket.on("join-room", (room) => {
+    socket.join(room);
+    socket.to(room).emit("notification", `${user.username} joined ${room}`);
   });
 
-  // Handle chat messages
-  socket.on('send_message', (messageData) => {
-    const message = {
-      ...messageData,
-      id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
-      senderId: socket.id,
-      timestamp: new Date().toISOString(),
-    };
-    
-    messages.push(message);
-    
-    // Limit stored messages to prevent memory issues
-    if (messages.length > 100) {
-      messages.shift();
-    }
-    
-    io.emit('receive_message', message);
-  });
-
-  // Handle typing indicator
-  socket.on('typing', (isTyping) => {
-    if (users[socket.id]) {
-      const username = users[socket.id].username;
-      
-      if (isTyping) {
-        typingUsers[socket.id] = username;
-      } else {
-        delete typingUsers[socket.id];
-      }
-      
-      io.emit('typing_users', Object.values(typingUsers));
-    }
-  });
-
-  // Handle private messages
-  socket.on('private_message', ({ to, message }) => {
-    const messageData = {
-      id: Date.now(),
-      sender: users[socket.id]?.username || 'Anonymous',
-      senderId: socket.id,
+  socket.on("send-message", ({ room, message, type = "text", file }) => {
+    const msg = {
+      id: Date.now() + Math.random(),
+      sender: user.username,
       message,
-      timestamp: new Date().toISOString(),
-      isPrivate: true,
+      type,
+      file,
+      timestamp: new Date(),
     };
-    
-    socket.to(to).emit('private_message', messageData);
-    socket.emit('private_message', messageData);
+    io.to(room).emit("receive-message", msg);
   });
 
-  // Handle disconnection
-  socket.on('disconnect', () => {
-    if (users[socket.id]) {
-      const { username } = users[socket.id];
-      io.emit('user_left', { username, id: socket.id });
-      console.log(`${username} left the chat`);
+  socket.on("typing", ({ room, isTyping }) => {
+    if (isTyping) typingUsers.add(user.username);
+    else typingUsers.delete(user.username);
+    socket.to(room).emit("typing", { username: user.username, isTyping });
+  });
+
+  socket.on("private-message", ({ to, message }) => {
+    const recipient = Array.from(onlineUsers.values()).find(u => u.username === to);
+    if (recipient) {
+      socket.to(recipient.socketId).emit("private-message", {
+        from: user.username,
+        message,
+        timestamp: new Date(),
+      });
     }
-    
-    delete users[socket.id];
-    delete typingUsers[socket.id];
-    
-    io.emit('user_list', Object.values(users));
-    io.emit('typing_users', Object.values(typingUsers));
+  });
+
+  socket.on("disconnect", () => {
+    onlineUsers.delete(user.id);
+    io.emit("user-offline", { userId: user.id });
   });
 });
 
-// API routes
-app.get('/api/messages', (req, res) => {
-  res.json(messages);
-});
-
-app.get('/api/users', (req, res) => {
-  res.json(Object.values(users));
-});
-
-// Root route
-app.get('/', (req, res) => {
-  res.send('Socket.io Chat Server is running');
-});
-
-// Start server
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
-
-module.exports = { app, server, io }; 
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
